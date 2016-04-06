@@ -1,0 +1,10 @@
+{
+  "family":{
+    "debian":{
+      "ipxe-boot-images":"ipxe"
+    }
+  },
+  "default":{
+    "ipxe-boot-images":"ipxe-bootimgs"
+  }
+}
