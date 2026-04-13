@@ -247,6 +247,12 @@ if [ -z "$*" ]; then
 fi
 arg_to_elements "$@"
 
+# no-final-image: the chroot is the final artefact; image type conversion
+# is not applicable.
+if [[ $IMAGE_ELEMENT =~ no-final-image ]]; then
+    IMAGE_TYPES=()
+fi
+
 # start tracing after most boilerplate
 if [ ${DIB_DEBUG_TRACE} -gt 0 ]; then
     set -x
@@ -369,182 +375,185 @@ run_d post-root
 if [ -e "$TMP_BUILD_DIR/mnt/lost+found" ]; then
     sudo rm -rf "$TMP_BUILD_DIR/mnt/lost+found"
 fi
-# Free up /mnt
-unmount_image
-mv $TMP_BUILD_DIR/mnt $TMP_BUILD_DIR/built
 
-# save xtrace state, as we always want to turn it off to avoid
-# spamming the logs with du output below.
-xtrace=$(set +o | grep xtrace)
+if [[ ! $IMAGE_ELEMENT =~ no-final-image ]]; then
+    # Free up /mnt
+    unmount_image
+    mv $TMP_BUILD_DIR/mnt $TMP_BUILD_DIR/built
 
-# temp file for holding du output
-du_output=${TMP_BUILD_DIR}/du_output.tmp
+    # save xtrace state, as we always want to turn it off to avoid
+    # spamming the logs with du output below.
+    xtrace=$(set +o | grep xtrace)
 
-if [ -n "$DIB_IMAGE_SIZE" ]; then
-    du_size=$(echo "$DIB_IMAGE_SIZE" | awk '{printf("%d\n",$1 * 1024 *1024)}')
-else
-    set +o xtrace
-    echo "Calculating image size (this may take a minute)..."
-    sudo du -a -c -x ${TMP_BUILD_DIR}/built > ${du_output}
-    # the last line is the total size from "-c".
-    if [ -n "$DIB_IMAGE_EXTRA_SIZE" ]; then
-        # add DIB_IMAGE_EXTRA_SIZE megabytes to create a bigger image as requested
-        du_extra_size=$(echo "$DIB_IMAGE_EXTRA_SIZE" | awk '{printf("%d\n",$1 * 1024)}')
-        du_size_tmp=$(tail -n1 ${du_output} | cut -f1)
-        du_size=$(echo "$du_size_tmp $du_extra_size" | awk '{print int($1 + $2)}')
+    # temp file for holding du output
+    du_output=${TMP_BUILD_DIR}/du_output.tmp
+
+    if [ -n "$DIB_IMAGE_SIZE" ]; then
+        du_size=$(echo "$DIB_IMAGE_SIZE" | awk '{printf("%d\n",$1 * 1024 *1024)}')
     else
-        # scale this by 0.6 to create a slightly bigger image
-        du_size=$(tail -n1 ${du_output} | cut -f1 | awk '{print int($1 / 0.6)}')
-    fi
-    $xtrace
-fi
-
-if [[ "${DIB_SHOW_IMAGE_USAGE:-0}" != 0 ]]; then
-    set +o xtrace
-    if [ ! -f "$du_output" ]; then
+        set +o xtrace
+        echo "Calculating image size (this may take a minute)..."
         sudo du -a -c -x ${TMP_BUILD_DIR}/built > ${du_output}
+        # the last line is the total size from "-c".
+        if [ -n "$DIB_IMAGE_EXTRA_SIZE" ]; then
+            # add DIB_IMAGE_EXTRA_SIZE megabytes to create a bigger image as requested
+            du_extra_size=$(echo "$DIB_IMAGE_EXTRA_SIZE" | awk '{printf("%d\n",$1 * 1024)}')
+            du_size_tmp=$(tail -n1 ${du_output} | cut -f1)
+            du_size=$(echo "$du_size_tmp $du_extra_size" | awk '{print int($1 + $2)}')
+        else
+            # scale this by 0.6 to create a slightly bigger image
+            du_size=$(tail -n1 ${du_output} | cut -f1 | awk '{print int($1 / 0.6)}')
+        fi
+        $xtrace
     fi
 
-    du_output_show="sort -nr ${du_output} |
-                     numfmt --to=iec-i --padding=7
-                       --suffix=B --field=1 --from-unit=1024"
+    if [[ "${DIB_SHOW_IMAGE_USAGE:-0}" != 0 ]]; then
+        set +o xtrace
+        if [ ! -f "$du_output" ]; then
+            sudo du -a -c -x ${TMP_BUILD_DIR}/built > ${du_output}
+        fi
 
-    # by default show the 10MiB and greater files & directories -- a
-    # dir with lots of little files will still show up, but this helps
-    # signal:noise ratio
-    if [[ ${DIB_SHOW_IMAGE_USAGE_FULL:-0} == 0 ]]; then
-        # numfmt will start giving a decimal place when < 10MiB
-        du_output_show+="| egrep 'MiB|GiB|TiB|PiB' | grep -v '\..MiB'"
-        echo "================================="
-        echo "Image size report (files > 10MiB)"
-        echo "================================="
+        du_output_show="sort -nr ${du_output} |
+                         numfmt --to=iec-i --padding=7
+                           --suffix=B --field=1 --from-unit=1024"
+
+        # by default show the 10MiB and greater files & directories -- a
+        # dir with lots of little files will still show up, but this helps
+        # signal:noise ratio
+        if [[ ${DIB_SHOW_IMAGE_USAGE_FULL:-0} == 0 ]]; then
+            # numfmt will start giving a decimal place when < 10MiB
+            du_output_show+="| egrep 'MiB|GiB|TiB|PiB' | grep -v '\..MiB'"
+            echo "================================="
+            echo "Image size report (files > 10MiB)"
+            echo "================================="
+        else
+            echo "================="
+            echo "Image size report"
+            echo "================="
+        fi
+
+        eval ${du_output_show}
+
+        echo
+        echo "===== end image size report ====="
+        echo
+
+        $xtrace
+    fi
+
+    rm -f ${du_output}
+
+    if [ -n "$DIB_JOURNAL_SIZE" ]; then
+        journal_size="$DIB_JOURNAL_SIZE"
     else
-        echo "================="
-        echo "Image size report"
-        echo "================="
+        journal_size=64
     fi
 
-    eval ${du_output_show}
+    if [ "$DIB_ROOT_FSTYPE" = "ext4" ] ; then
+      # Very conservative to handle images being resized a lot
+      # We set journal size to 64M so our journal is large enough when we
+      # perform an FS resize.
+      MKFS_OPTS="-i 4096 -J size=$journal_size $MKFS_OPTS"
 
-    echo
-    echo "===== end image size report ====="
-    echo
+      # NOTE(ianw) 2019-12-11 : this is a terrible hack ... if building on
+      # >=Bionic hosts, mkfs sets "metadata_csum" for ext4 filesystems,
+      # which makes broken Trusty images as that era fsck doesn't
+      # understand this flag.  The image will stop in early boot
+      # complaining:
+      #
+      #  Serious errors were found while checking the disk drive for /.
+      #
+      # We do not really have any suitable hook points where one of the
+      # ubuntu elements or block-device-* could set this override flag for
+      # just Trusty.  We probably should, but desire to implement more
+      # code to support the out-of-date trusty at this point is
+      # non-existant.  So hack in disabling this here.
+      if [[ ${DIB_RELEASE} == "trusty" ]]; then
+          MKFS_OPTS="-O ^metadata_csum $MKFS_OPTS"
+      fi
 
-    $xtrace
-fi
-
-rm -f ${du_output}
-
-if [ -n "$DIB_JOURNAL_SIZE" ]; then
-    journal_size="$DIB_JOURNAL_SIZE"
-else
-    journal_size=64
-fi
-
-if [ "$DIB_ROOT_FSTYPE" = "ext4" ] ; then
-  # Very conservative to handle images being resized a lot
-  # We set journal size to 64M so our journal is large enough when we
-  # perform an FS resize.
-  MKFS_OPTS="-i 4096 -J size=$journal_size $MKFS_OPTS"
-
-  # NOTE(ianw) 2019-12-11 : this is a terrible hack ... if building on
-  # >=Bionic hosts, mkfs sets "metadata_csum" for ext4 filesystems,
-  # which makes broken Trusty images as that era fsck doesn't
-  # understand this flag.  The image will stop in early boot
-  # complaining:
-  #
-  #  Serious errors were found while checking the disk drive for /.
-  #
-  # We do not really have any suitable hook points where one of the
-  # ubuntu elements or block-device-* could set this override flag for
-  # just Trusty.  We probably should, but desire to implement more
-  # code to support the out-of-date trusty at this point is
-  # non-existant.  So hack in disabling this here.
-  if [[ ${DIB_RELEASE} == "trusty" ]]; then
-      MKFS_OPTS="-O ^metadata_csum $MKFS_OPTS"
-  fi
-
-  # Grow the image size to account for the journal, only if the user
-  # has not asked for a specific size.
-  if [ -z "$DIB_IMAGE_SIZE" ]; then
-    du_size=$(( $du_size + ($journal_size * 1024) ))
-  fi
-fi
-
-# EFI system partitions default to be quite large at 512mb for maximum
-# compatability (see notes in
-# 7fd52ba84180b4e749ccf4c9db8c49eafff46ea8) .  We need to increase the
-# total size to account for this, or we run out of space creating the
-# final image.  See if we have included the block-device-efi element,
-# which implies we have a large EFI partition, and then pad the final
-# image size.
-if [[ ${IMAGE_ELEMENT} =~ "block-device-efi" ]]; then
-    echo "Expanding disk for EFI partition"
-    du_size=$(( $du_size + (525 * 1024) ))
-fi
-
-# Rounding down size so that is is a multiple of 64, works around a bug in
-# qemu-img that may occur when compressing raw images that aren't a multiple
-# of 64k. https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1180021
-export DIB_IMAGE_SIZE=$(echo "$du_size" | awk ' { if ($1 % 64 != 0) print $1 + 64 - ( $1 % 64); else print $1; } ')
-
-if [ -n "$MAX_ONLINE_RESIZE" ]; then
-    MKFS_OPTS="-E resize=$MAX_ONLINE_RESIZE $MKFS_OPTS"
-fi
-
-export TMP_IMAGE_DIR
-# Try the 'old fashioned' way calling the block device
-# phase. If this gives no result, use the configuration based approach:
-eval_run_d block-device "IMAGE_BLOCK_DEVICE="
-
-if [ -z ${IMAGE_BLOCK_DEVICE} ] ; then
-    # For compatibily reasons in addition to the YAML configuration
-    # there is the need to handle the old environment variables.
-    echo "image-size: ${DIB_IMAGE_SIZE}KiB" >> ${DIB_BLOCK_DEVICE_PARAMS_YAML}
-
-    if [ -n "${MKFS_OPTS}" ] ; then
-        echo "root-fs-opts: '${MKFS_OPTS}'" >> ${DIB_BLOCK_DEVICE_PARAMS_YAML}
+      # Grow the image size to account for the journal, only if the user
+      # has not asked for a specific size.
+      if [ -z "$DIB_IMAGE_SIZE" ]; then
+        du_size=$(( $du_size + ($journal_size * 1024) ))
+      fi
     fi
 
-    # After changeing the parameters, there is the need to
-    # re-run ${DIB_BLOCK_DEVICE} init because some value might
-    # change based on the new set parameters.
-    ${DIB_BLOCK_DEVICE} init
+    # EFI system partitions default to be quite large at 512mb for maximum
+    # compatability (see notes in
+    # 7fd52ba84180b4e749ccf4c9db8c49eafff46ea8) .  We need to increase the
+    # total size to account for this, or we run out of space creating the
+    # final image.  See if we have included the block-device-efi element,
+    # which implies we have a large EFI partition, and then pad the final
+    # image size.
+    if [[ ${IMAGE_ELEMENT} =~ "block-device-efi" ]]; then
+        echo "Expanding disk for EFI partition"
+        du_size=$(( $du_size + (525 * 1024) ))
+    fi
 
-    # values to ${DIB_BLOCK_DEVICE}: using the YAML config and
-    ${DIB_BLOCK_DEVICE} create
+    # Rounding down size so that is is a multiple of 64, works around a bug in
+    # qemu-img that may occur when compressing raw images that aren't a multiple
+    # of 64k. https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1180021
+    export DIB_IMAGE_SIZE=$(echo "$du_size" | awk ' { if ($1 % 64 != 0) print $1 + 64 - ( $1 % 64); else print $1; } ')
 
-    # This is the device (/dev/loopX).  It's where to install the
-    # bootloader.
-    IMAGE_BLOCK_DEVICE=$(${DIB_BLOCK_DEVICE} getval image-block-device)
-    export IMAGE_BLOCK_DEVICE
+    if [ -n "$MAX_ONLINE_RESIZE" ]; then
+        MKFS_OPTS="-E resize=$MAX_ONLINE_RESIZE $MKFS_OPTS"
+    fi
 
-    # Similar to above, but all mounted devices.  This is handy for
-    # some bootloaders that have multi-partition layouts and want to
-    # copy things to different places other than just
-    # IMAGE_BLOCK_DEVICE.  "eval" this into an array as needed
-    IMAGE_BLOCK_DEVICES=$(${DIB_BLOCK_DEVICE} getval image-block-devices)
-    export IMAGE_BLOCK_DEVICES
+    export TMP_IMAGE_DIR
+    # Try the 'old fashioned' way calling the block device
+    # phase. If this gives no result, use the configuration based approach:
+    eval_run_d block-device "IMAGE_BLOCK_DEVICE="
 
-    # Write the fstab
-    ${DIB_BLOCK_DEVICE} writefstab
-fi
+    if [ -z ${IMAGE_BLOCK_DEVICE} ] ; then
+        # For compatibily reasons in addition to the YAML configuration
+        # there is the need to handle the old environment variables.
+        echo "image-size: ${DIB_IMAGE_SIZE}KiB" >> ${DIB_BLOCK_DEVICE_PARAMS_YAML}
 
-# XXX: needed?
-LOOPDEV=${IMAGE_BLOCK_DEVICE}
+        if [ -n "${MKFS_OPTS}" ] ; then
+            echo "root-fs-opts: '${MKFS_OPTS}'" >> ${DIB_BLOCK_DEVICE_PARAMS_YAML}
+        fi
 
-# At this point, ${DIB_BLOCK_DEVICE} has created the raw image file
-# (IMAGE_BLOCK_DEVICE) and mounted all the partitions under
-# $TMP_BUILD_DIR/mnt for us.  We can now copy into the final image.
+        # After changeing the parameters, there is the need to
+        # re-run ${DIB_BLOCK_DEVICE} init because some value might
+        # change based on the new set parameters.
+        ${DIB_BLOCK_DEVICE} init
 
-# 'mv' is not usable here - especially when a top level directory
-# has the same name as a mount point of a partition.  If so, 'mv'
-# will complain:
-# mv: inter-device move failed: '...' to '...'; \
-#       unable to remove target: Device or resource busy
-# therefore a 'cp' and 'rm' approach is used.
-sudo cp -ra ${TMP_BUILD_DIR}/built/* $TMP_BUILD_DIR/mnt
-sudo rm -fr ${TMP_BUILD_DIR}/built/*
+        # values to ${DIB_BLOCK_DEVICE}: using the YAML config and
+        ${DIB_BLOCK_DEVICE} create
+
+        # This is the device (/dev/loopX).  It's where to install the
+        # bootloader.
+        IMAGE_BLOCK_DEVICE=$(${DIB_BLOCK_DEVICE} getval image-block-device)
+        export IMAGE_BLOCK_DEVICE
+
+        # Similar to above, but all mounted devices.  This is handy for
+        # some bootloaders that have multi-partition layouts and want to
+        # copy things to different places other than just
+        # IMAGE_BLOCK_DEVICE.  "eval" this into an array as needed
+        IMAGE_BLOCK_DEVICES=$(${DIB_BLOCK_DEVICE} getval image-block-devices)
+        export IMAGE_BLOCK_DEVICES
+
+        # Write the fstab
+        ${DIB_BLOCK_DEVICE} writefstab
+    fi
+
+    # XXX: needed?
+    LOOPDEV=${IMAGE_BLOCK_DEVICE}
+
+    # At this point, ${DIB_BLOCK_DEVICE} has created the raw image file
+    # (IMAGE_BLOCK_DEVICE) and mounted all the partitions under
+    # $TMP_BUILD_DIR/mnt for us.  We can now copy into the final image.
+
+    # 'mv' is not usable here - especially when a top level directory
+    # has the same name as a mount point of a partition.  If so, 'mv'
+    # will complain:
+    # mv: inter-device move failed: '...' to '...'; \
+    #       unable to remove target: Device or resource busy
+    # therefore a 'cp' and 'rm' approach is used.
+    sudo cp -ra ${TMP_BUILD_DIR}/built/* $TMP_BUILD_DIR/mnt
+    sudo rm -fr ${TMP_BUILD_DIR}/built/*
+fi  # ! no-final-image
 
 mount_proc_dev_sys
 run_d pre-finalise
