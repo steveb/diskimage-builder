@@ -39,7 +39,9 @@ function trap_cleanup() {
 
 function cleanup () {
     unmount_image
-    ${DIB_PYTHON_EXEC} ${_LIB}/dib-block-device.py umount
+    if [[ ! $IMAGE_ELEMENT =~ no-final-image ]]; then
+        ${DIB_PYTHON_EXEC} ${_LIB}/dib-block-device.py umount
+    fi
     cleanup_build_dir
     cleanup_image_dir
 }
